@@ -14,6 +14,7 @@ from step3_mat_map import (
     extract_material_base_image,
     extract_material_linked_pbr_images,
     extract_mmd_or_bsdf_props,
+    get_pbr_defaults_for_role,
 )
 
 _SUPPORTED_EXTS = (
@@ -172,7 +173,7 @@ def _resolve_image_pil_strict(img_obj, fallback_dirs, fallback_index):
 
 
 def _find_standalone_emissive(base_img_obj, disk_path, linked_pbr, fallback_dirs):
-    """如果有单独的 _E 贴图才挂独立贴图"""
+    """仅查找明确命名的独立自发光贴图（_E / _Glow / _Light 等）"""
     if "emissive" in linked_pbr:
         return ("img_obj", linked_pbr["emissive"])
 
@@ -342,8 +343,9 @@ def _save_and_load_img(pil_img, out_path, colorspace="sRGB", is_png=False):
 
 def _rebuild_principled_material(mat, role, props, baked):
     """
-    重建 Principled BSDF：
-    彻底直接赋予常亮自发光（无论在什么恶劣光照或无灯环境下均清晰可见）
+    重建与角色 VRM/MToon 受光同步的 Principled BSDF：
+    - 普通武器主体：纯漫反射（Metallic=0.05, Roughness=0.55），正常接收场景光照、阴影与投射，彻底杜绝日光灯管
+    - 自发光：仅在真正存在独立 _E 贴图或显式发光件（fx_glow）时启用
     """
     mat.use_nodes = True
     nt = mat.node_tree
@@ -364,12 +366,12 @@ def _rebuild_principled_material(mat, role, props, baked):
     is_dead = is_outline or (role == "outline")
     eff_alpha = 0.0 if is_dead else mat_alpha
 
-    # 刚性二次元物体通用 PBR：零金属、中等粗糙度，杜绝在没有天光时死黑
-    bsdf.inputs["Metallic"].default_value = 0.0
-    bsdf.inputs["Roughness"].default_value = 0.6
+    # 关键：微量金属度（0.05）避免反射暗环境死黑，中等粗糙度（0.55）让漫反射过渡平滑，与二次元角色完全同频
+    bsdf.inputs["Metallic"].default_value = 0.05
+    bsdf.inputs["Roughness"].default_value = 0.55
     for sp_name in ("Specular IOR Level", "Specular"):
         if sp_name in bsdf.inputs:
-            bsdf.inputs[sp_name].default_value = 0.2
+            bsdf.inputs[sp_name].default_value = 0.25
 
     lit_img = baked.get("lit_img")
     alpha_mode = (
@@ -397,35 +399,45 @@ def _rebuild_principled_material(mat, role, props, baked):
     else:
         dr, dg, db = diffuse_rgb
         ar, ag, ab = ambient_rgb
-        col = (max(dr, ar), max(dg, ag), max(db, ab), 1.0)
+        # 微调固有色（融合 20% ambient），暗部不发黑，同时保留光影反应
+        col = (
+            min(1.0, dr * 0.8 + ar * 0.2),
+            min(1.0, dg * 0.8 + ag * 0.2),
+            min(1.0, db * 0.8 + ab * 0.2),
+            1.0,
+        )
         bsdf.inputs["Base Color"].default_value = col
         if alpha_mode == "BLEND":
             bsdf.inputs["Alpha"].default_value = eff_alpha
 
-    # ===== 直接设置自发光通道（对标人物管线常亮） =====
+    # ===== 自发光通道（克制、准确） =====
     emi_img = baked.get("emi_img")
     emi_sock = bsdf.inputs.get("Emission Color") or bsdf.inputs.get("Emission")
     strength_sock = bsdf.inputs.get("Emission Strength")
 
-    if emi_sock is not None and not is_dead:
-        if emi_img is not None:
-            # 1. 有独立自发光贴图，直接挂
-            tex_e = nt.nodes.new("ShaderNodeTexImage")
-            tex_e.location = (-400, -120)
-            tex_e.image = emi_img
-            nt.links.new(tex_e.outputs["Color"], emi_sock)
-            emi_tag = f"独立贴图({emi_img.name})"
-        elif color_out_sock is not None:
-            # 2. 没有独立自发光贴图：直接把漫反射贴图全量连给自发光！
-            nt.links.new(color_out_sock, emi_sock)
-            emi_tag = f"主图直通({lit_img.name})"
-        else:
-            # 3. 纯色材质：直接赋值
-            emi_sock.default_value = bsdf.inputs["Base Color"].default_value
-            emi_tag = "纯色直通"
-
+    if emi_img is not None and not is_dead and emi_sock is not None:
+        # 1. 存在独立的 _E 发光贴图：挂接并赋标准强度 1.0
+        tex_e = nt.nodes.new("ShaderNodeTexImage")
+        tex_e.location = (-400, -120)
+        tex_e.image = emi_img
+        nt.links.new(tex_e.outputs["Color"], emi_sock)
         if strength_sock is not None:
             strength_sock.default_value = 1.0
+        emi_tag = f"独立发光贴图({emi_img.name})"
+    elif role == "fx_glow" and not is_dead and emi_sock is not None:
+        # 2. 材质名明确叫灯条/能量件/屏幕/特效
+        if color_out_sock is not None:
+            nt.links.new(color_out_sock, emi_sock)
+        else:
+            emi_sock.default_value = bsdf.inputs["Base Color"].default_value
+        if strength_sock is not None:
+            strength_sock.default_value = 1.0
+        emi_tag = "发光件材质(1.0)"
+    else:
+        # 3. 普通实体材质：自发光彻底归零！不抢戏，完全跟随场景灯光
+        if strength_sock is not None:
+            strength_sock.default_value = 0.0
+        emi_tag = "无(正常受光)"
 
     if alpha_mode == "BLEND":
         if hasattr(mat, "blend_method"):
@@ -471,7 +483,7 @@ def run(config):
     max_tex_size = int(config.get("max_tex_size", 1024))
     en_safe = re.sub(r"[^a-zA-Z0-9_\-]", "_", config.get("en_name", "item"))
     print(
-        f">>> [步骤 3] 全量赋予常亮自发光通道，重建 glTF Principled BSDF（上限 {max_tex_size}px）..."
+        f">>> [步骤 3] 重建与角色受光同步的 glTF Principled BSDF 材质（上限 {max_tex_size}px）..."
     )
 
     temp_dir = os.path.join(tempfile.gettempdir(), "weapon2glb_baked", en_safe)
@@ -551,7 +563,7 @@ def run(config):
                     )
                     protected_images.add(lit_img)
 
-                    # 仅在真有独立 _E 贴图时挂独立图，否则直接用 lit_img 自发光
+                    # 仅在真有独立 _E 贴图时加载伴生图
                     emi_src = _find_standalone_emissive(
                         orig_img, disk_path, linked_pbr, fallback_dirs
                     )
